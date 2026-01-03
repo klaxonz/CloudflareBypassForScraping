@@ -132,6 +132,7 @@ def setup_routes(app: FastAPI):
 
     @app.get("/html", responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
     async def get_html(
+        request: Request,
         url: str = Query(..., description="Target URL to get HTML content for"),
         retries: int = Query(5, ge=1, le=10, description="Number of retry attempts"),
         proxy: Optional[str] = Query(None, description="Proxy URL (optional)"),
@@ -140,6 +141,9 @@ def setup_routes(app: FastAPI):
         """
         Get HTML content from a URL after bypassing Cloudflare protection.
         Returns the raw HTML content directly.
+
+        You can pass custom headers (like Cookie, Authorization, etc.) in the request,
+        and they will be forwarded to the target website.
         """
         # Validate URL
         if not is_safe_url(url):
@@ -158,12 +162,22 @@ def setup_routes(app: FastAPI):
         try:
             start_time = time.time()
             logger.info(f"Getting HTML content for {url} (retries: {retries}, proxy: {'yes' if proxy else 'no'})")
-            
+
+            # Extract custom headers from the request
+            custom_headers = {}
+            for key, value in request.headers.items():
+                # Skip internal headers and host header
+                if not key.lower().startswith(('host', 'content-length', 'content-type', 'connection', 'accept-encoding')):
+                    custom_headers[key] = value
+
+            if custom_headers:
+                logger.info(f"Forwarding custom headers: {list(custom_headers.keys())}")
+
             # Use the global bypasser or create a new one
             bypasser = global_bypasser or CamoufoxBypasser(max_retries=retries, log=True)
-            
-            # Get HTML content using the new method
-            data = await bypasser.get_or_generate_html(url, proxy, bypass_cache=bypassCookieCache)
+
+            # Get HTML content using the new method with custom headers
+            data = await bypasser.get_or_generate_html(url, proxy, bypass_cache=bypassCookieCache, custom_headers=custom_headers)
             
             if not data:
                 raise HTTPException(status_code=500, detail="Failed to bypass Cloudflare protection")

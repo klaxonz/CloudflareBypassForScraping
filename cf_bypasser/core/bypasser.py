@@ -282,8 +282,8 @@ class CamoufoxBypasser:
         finally:
             await self.cleanup_browser(camoufox, browser, context, page)
 
-    async def get_or_generate_html(self, url: str, proxy: Optional[str] = None, bypass_cache: bool = False) -> Optional[Dict[str, Any]]:
-        """Get HTML content along with cookies (cached or fresh)."""
+    async def get_or_generate_html(self, url: str, proxy: Optional[str] = None, bypass_cache: bool = False, custom_headers: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
+        """Get HTML content along with cookies (cached or fresh). Supports custom headers for authenticated requests."""
         hostname = urlparse(url).netloc
         cache_key = md5_hash(hostname + (proxy or ""))
         
@@ -310,7 +310,7 @@ class CamoufoxBypasser:
         try:
             # Setup browser and solve challenge
             camoufox, browser, context, page = await self.setup_browser(proxy, user_agent=cached_ua)
-            
+
             if cached_cookies:
                 self.log_message("Restoring cached cookies...")
                 # Convert dict to list of cookie objects
@@ -322,7 +322,12 @@ class CamoufoxBypasser:
                         'url': url  # Use the target URL for the cookie
                     })
                 await context.add_cookies(cookie_list)
-            
+
+            # Set custom headers if provided
+            if custom_headers:
+                self.log_message(f"Setting custom headers: {list(custom_headers.keys())}")
+                await page.set_extra_http_headers(custom_headers)
+
             if await self.solve_cloudflare_challenge(url, page):
                 data = await self.get_html_content_and_cookies(context, page)
                 if data and data["cookies"]:
