@@ -17,6 +17,13 @@ from cf_bypasser.utils.config import BrowserConfig, OPERATING_SYSTEMS
 # Get addon path for Camoufox init script workaround
 ADDON_PATH = get_addon_path()
 
+# Timeout constants (in seconds)
+CAPTCHA_SOLVE_TIMEOUT = 60  # Max time for captcha solving
+PAGE_LOAD_TIMEOUT = 15000   # Page navigation timeout (ms)
+INITIAL_WAIT_MAX = 5        # Max initial wait for page load
+BYPASS_CHECK_INTERVAL = 0.5 # Interval for checking bypass status
+COOKIE_SET_WAIT = 2         # Wait time after successful bypass
+
 
 class CamoufoxBypasser:
     """Camoufox bypasser with cookie caching and direct proxy support."""
@@ -148,49 +155,76 @@ class CamoufoxBypasser:
             self.log_message(f"Error determining challenge type: {e}")
             return None
 
+    async def _wait_for_page_ready(self, page, max_wait: float = INITIAL_WAIT_MAX) -> bool:
+        """Wait for page to be ready with dynamic checking instead of fixed sleep."""
+        start_time = time.time()
+        while time.time() - start_time < max_wait:
+            if await self.is_bypassed(page):
+                self.log_message(f"Page ready after {time.time() - start_time:.1f}s")
+                return True
+            await asyncio.sleep(BYPASS_CHECK_INTERVAL)
+        return False
+
+    async def _solve_captcha_with_timeout(self, solver, page, challenge_type) -> bool:
+        """Solve captcha with timeout protection."""
+        try:
+            self.log_message(f"Starting captcha solver with {CAPTCHA_SOLVE_TIMEOUT}s timeout...")
+            await asyncio.wait_for(
+                solver.solve_captcha(
+                    captcha_container=page,
+                    captcha_type=challenge_type,
+                    expected_content_selector="#root",
+                ),
+                timeout=CAPTCHA_SOLVE_TIMEOUT
+            )
+            title = await page.title()
+            return "just a moment" not in title.lower()
+        except asyncio.TimeoutError:
+            self.log_message(f"Captcha solver timed out after {CAPTCHA_SOLVE_TIMEOUT}s")
+            return False
+        except Exception as e:
+            self.log_message(f"Captcha solver error: {e}")
+            return False
+
     async def solve_cloudflare_challenge(self, url: str, page) -> bool:
         """Navigate to URL and solve Cloudflare challenge using playwright-captcha."""
         try:
             # Navigate to the target URL
             self.log_message(f"Navigating to {url}")
-            await page.goto(url, wait_until="domcontentloaded", timeout=10000)
-            
-            # Wait for page to load
-            await asyncio.sleep(8)
+            await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
 
-            # Check if we need to solve a challenge
-            if await self.is_bypassed(page):
+            # Dynamic wait instead of fixed 8 seconds
+            self.log_message("Waiting for page to load...")
+            if await self._wait_for_page_ready(page):
                 self.log_message("No Cloudflare challenge detected or already bypassed")
                 return True
 
+            # Check if we need to solve a challenge
             self.log_message("Cloudflare challenge detected. Attempting to solve...")
             challenge_type = await self.determine_challenge_type(page)
             if not challenge_type:
                 self.log_message("Could not determine challenge type")
                 return False
-            
-            expected_selector = "#root"
-            captcha_container = page
-            is_solved = False                
-            async with ClickSolver(framework=FrameworkType.CAMOUFOX, page=page, max_attempts=2, attempt_delay=1) as solver:
- 
-                await solver.solve_captcha(
-                    captcha_container=captcha_container,
-                    captcha_type=challenge_type,
-                    expected_content_selector=expected_selector,)
 
-                is_solved = "just a moment" not in await page.title()
-            
+            self.log_message(f"Challenge type: {challenge_type}")
+
+            # Solve with timeout protection
+            is_solved = False
+            async with ClickSolver(framework=FrameworkType.CAMOUFOX, page=page, max_attempts=2, attempt_delay=1) as solver:
+                is_solved = await self._solve_captcha_with_timeout(solver, page, challenge_type)
 
             if is_solved:
-                self.log_message("✅ Cloudflare challenge solved successfully!")
-                # Wait a bit more to ensure cookies are set
-                await asyncio.sleep(3)
+                self.log_message("Cloudflare challenge solved successfully!")
+                # Wait for cookies to be set
+                await asyncio.sleep(COOKIE_SET_WAIT)
                 return True
             else:
-                self.log_message("❌ Failed to solve Cloudflare challenge")
+                self.log_message("Failed to solve Cloudflare challenge")
                 return False
 
+        except asyncio.TimeoutError:
+            self.log_message(f"Page navigation timed out for {url}")
+            return False
         except Exception as e:
             self.log_message(f"Error solving Cloudflare challenge: {e}")
             return False
@@ -344,31 +378,28 @@ class CamoufoxBypasser:
             await self.cleanup_browser(camoufox, browser, context, page)
 
     async def cleanup_browser(self, camoufox, browser, context, page) -> None:
-        """Clean up browser resources."""
-        try:
-            # Close page first
-            if page:
-                try:
-                    await page.close()
-                except Exception as e:
-                    self.log_message(f"Error closing page: {e}")
-                
-            # Close context second
-            if context:
-                try:
-                    await context.close()
-                except Exception as e:
-                    self.log_message(f"Error closing context: {e}")
-                
-            # Close the AsyncCamoufox wrapper
-            if camoufox:
-                try:
-                    await camoufox.__aexit__(None, None, None)
-                except Exception as e:
-                    self.log_message(f"Error closing camoufox: {e}")
-                    
-        except Exception as e:
-            self.log_message(f"Error during cleanup: {e}")
+        """Clean up browser resources with timeout protection."""
+        cleanup_timeout = 10  # seconds
+
+        async def _safe_close(name: str, close_coro):
+            """Safely close a resource with timeout."""
+            try:
+                await asyncio.wait_for(close_coro, timeout=cleanup_timeout)
+                self.log_message(f"Closed {name}")
+            except asyncio.TimeoutError:
+                self.log_message(f"Timeout closing {name}")
+            except Exception as e:
+                self.log_message(f"Error closing {name}: {e}")
+
+        # Close in order: page -> context -> camoufox
+        if page:
+            await _safe_close("page", page.close())
+
+        if context:
+            await _safe_close("context", context.close())
+
+        if camoufox:
+            await _safe_close("camoufox", camoufox.__aexit__(None, None, None))
 
     async def cleanup(self) -> None:
         """Backward compatibility method - no longer stores browser instances."""
