@@ -23,6 +23,10 @@ PAGE_LOAD_TIMEOUT = 15000   # Page navigation timeout (ms)
 INITIAL_WAIT_MAX = 5        # Max initial wait for page load
 BYPASS_CHECK_INTERVAL = 0.5 # Interval for checking bypass status
 COOKIE_SET_WAIT = 2         # Wait time after successful bypass
+BROWSER_INIT_TIMEOUT = 60   # Max time for browser startup
+CONTEXT_INIT_TIMEOUT = 30   # Max time for context creation
+PAGE_INIT_TIMEOUT = 30      # Max time for page creation
+
 
 
 class CamoufoxBypasser:
@@ -101,34 +105,61 @@ class CamoufoxBypasser:
             else:
                 self.log_message("Failed to parse proxy, continuing without proxy")
 
-        # Use global lock to serialize browser initialization (browserforge is not thread-safe)
-        async with get_browser_init_lock():
-            camoufox = AsyncCamoufox(
-                headless=True,
-                geoip=True if proxy else False,
-                humanize=False,
-                os=selected_os,
-                locale=lang if lang else "en-US",
-                i_know_what_im_doing=True,
-                config={'forceScopeAccess': True, **random_config},
-                disable_coop=True,
-                main_world_eval=True,
-                addons=[os.path.abspath(ADDON_PATH)],
-                block_images=False,
-                block_webrtc=True,
-                enable_cache=False,
-            )
-            browser = await camoufox.__aenter__()
+        camoufox = None
+        browser = None
+        context = None
+        page = None
 
         # Create context with proxy if provided
         context_options = {}
         if proxy_config:
             context_options["proxy"] = proxy_config
 
-        context = await browser.new_context(**context_options)
-        page = await context.new_page()
-        
-        return camoufox, browser, context, page
+        try:
+            # Use global lock to serialize browser initialization (browserforge is not thread-safe)
+            async with get_browser_init_lock():
+                camoufox = AsyncCamoufox(
+                    headless=True,
+                    geoip=True if proxy else False,
+                    humanize=False,
+                    os=selected_os,
+                    locale=lang if lang else "en-US",
+                    i_know_what_im_doing=True,
+                    config={'forceScopeAccess': True, **random_config},
+                    disable_coop=True,
+                    main_world_eval=True,
+                    addons=[os.path.abspath(ADDON_PATH)],
+                    block_images=False,
+                    block_webrtc=True,
+                    enable_cache=False,
+                )
+                self.log_message("Launching browser...")
+                browser = await asyncio.wait_for(
+                    camoufox.__aenter__(),
+                    timeout=BROWSER_INIT_TIMEOUT
+                )
+
+            self.log_message("Creating browser context...")
+            context = await asyncio.wait_for(
+                browser.new_context(**context_options),
+                timeout=CONTEXT_INIT_TIMEOUT
+            )
+            self.log_message("Creating new page...")
+            page = await asyncio.wait_for(
+                context.new_page(),
+                timeout=PAGE_INIT_TIMEOUT
+            )
+
+            return camoufox, browser, context, page
+        except asyncio.TimeoutError:
+            self.log_message("Timed out during browser startup or context creation")
+            await self.cleanup_browser(camoufox, browser, context, page)
+            raise
+        except Exception as e:
+            self.log_message(f"Error setting up browser: {e}")
+            await self.cleanup_browser(camoufox, browser, context, page)
+            raise
+
 
     async def is_bypassed(self, page) -> bool:
         """Check if Cloudflare challenge has been bypassed."""
@@ -391,15 +422,19 @@ class CamoufoxBypasser:
             except Exception as e:
                 self.log_message(f"Error closing {name}: {e}")
 
-        # Close in order: page -> context -> camoufox
+        # Close in order: page -> context -> browser -> camoufox
         if page:
             await _safe_close("page", page.close())
 
         if context:
             await _safe_close("context", context.close())
 
+        if browser:
+            await _safe_close("browser", browser.close())
+
         if camoufox:
             await _safe_close("camoufox", camoufox.__aexit__(None, None, None))
+
 
     async def cleanup(self) -> None:
         """Backward compatibility method - no longer stores browser instances."""
